@@ -10,7 +10,10 @@ export default async ({ req, res, log, error }) => {
   const createdIds = []; // Track IDs for potential rollback
 
   try {
-    const { databaseId, collectionId, documents } = JSON.parse(req.body);
+    log(req.bodyJson);
+    log(req.body);
+
+    const { databaseId, collectionId, documents } = JSON.parse(req.bodyJson);
 
     log(`Starting transaction-style insert for ${documents.length} docs...`);
 

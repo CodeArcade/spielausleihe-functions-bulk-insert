@@ -7,18 +7,27 @@ export default async ({ req, res, log, error }) => {
     .setKey(process.env.APPWRITE_API_KEY);
 
   const databases = new Databases(client);
-  const createdIds = []; // Track IDs for potential rollback
+  const createdIds = [];
+
+  // Helper to handle body parsing across different trigger types
+  let body = req.bodyJson;
+  if (typeof body === 'string') {
+    try {
+      body = JSON.parse(body);
+    } catch (e) {
+      return res.json({ success: false, message: "Invalid JSON body string" }, 400);
+    }
+  }
+
+  const { databaseId, collectionId, documents } = body || {};
 
   try {
-    log(req.bodyJson);
-    log(req.body);
+    if (!databaseId || !collectionId || !Array.isArray(documents)) {
+      throw new Error("Missing databaseId, collectionId, or documents array.");
+    }
 
-    const { databaseId, collectionId, documents } = JSON.parse(req.bodyJson);
+    log(`Processing ${documents.length} documents...`);
 
-    log(`Starting transaction-style insert for ${documents.length} docs...`);
-
-    // We use a standard for...of loop here instead of Promise.all 
-    // because it allows us to stop immediately at the first failure.
     for (const data of documents) {
       try {
         const doc = await databases.createDocument(
@@ -29,33 +38,34 @@ export default async ({ req, res, log, error }) => {
         );
         createdIds.push(doc.$id);
       } catch (insertError) {
-        // Stop the loop and throw to the main catch block for rollback
-        throw new Error(`Insert failed: ${insertError.message}`);
+        // We throw a standard error but attach the Appwrite error message
+        throw new Error(insertError.message || "Unknown database error");
       }
     }
 
     return res.json({ success: true, count: createdIds.length }, 200);
 
   } catch (err) {
-    error("Transaction failed. Rolling back...");
+    error("Transaction failed: " + err.message);
 
-    // ROLLBACK LOGIC: Delete everything we just created
+    // Rollback Logic
     if (createdIds.length > 0) {
+      log(`Rolling back ${createdIds.length} documents...`);
       try {
-        const { databaseId, collectionId } = JSON.parse(req.body);
         await Promise.all(
           createdIds.map(id => databases.deleteDocument(databaseId, collectionId, id))
         );
-        log(`Rollback complete. Deleted ${createdIds.length} partial records.`);
-      } catch (rollbackError) {
-        error("CRITICAL: Rollback failed! Manual cleanup required for: " + createdIds.join(', '));
+        log("Rollback successful.");
+      } catch (rbErr) {
+        error("Critical: Rollback failed for IDs: " + createdIds.join(', '));
       }
     }
 
+    // Return the error to React with a 500 status code
     return res.json({
       success: false,
       message: err.message,
-      rolledBack: true,
+      rolledBack: createdIds.length > 0,
       failedAtCount: createdIds.length
     }, 500);
   }

@@ -8,60 +8,59 @@ export default async ({ req, res, log, error }) => {
 
   const databases = new Databases(client);
   const createdIds = [];
+  const BATCH_SIZE = 10;
+  const DELAY_MS = 150;
 
-  // Helper to handle body parsing across different trigger types
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
   let body = req.bodyJson;
   if (typeof body === 'string') {
-    try {
-      body = JSON.parse(body);
-    } catch (e) {
-      return res.json({ success: false, message: "Invalid JSON body string" }, 400);
-    }
+    try { body = JSON.parse(body); }
+    catch (e) { return res.json({ success: false, message: "Invalid JSON" }, 400); }
   }
 
   const { databaseId, collectionId, documents } = body || {};
 
   try {
     if (!databaseId || !collectionId || !Array.isArray(documents)) {
-      throw new Error("Missing databaseId, collectionId, or documents array.");
+      throw new Error("Missing required fields.");
     }
 
-    log(`Processing ${documents.length} documents...`);
+    log(`Processing ${documents.length} documents in batches of ${BATCH_SIZE}...`);
 
-    for (const data of documents) {
-      try {
-        const doc = await databases.createDocument(
-          databaseId,
-          collectionId,
-          ID.unique(),
-          data
-        );
+    for (let i = 0; i < documents.length; i += BATCH_SIZE) {
+      const batch = documents.slice(i, i + BATCH_SIZE);
+
+      // Execute batch concurrently
+      await Promise.all(batch.map(async (data) => {
+        const doc = await databases.createDocument(databaseId, collectionId, ID.unique(), data);
         createdIds.push(doc.$id);
-      } catch (insertError) {
-        // We throw a standard error but attach the Appwrite error message
-        throw new Error(insertError.message || "Unknown database error");
-      }
+      }));
+
+      // Small delay to let the network/API breathe
+      if (i + BATCH_SIZE < documents.length) await sleep(DELAY_MS);
     }
 
     return res.json({ success: true, count: createdIds.length }, 200);
 
   } catch (err) {
-    error("Transaction failed: " + err.message);
+    error("Batch execution failed: " + err.message);
 
-    // Rollback Logic
     if (createdIds.length > 0) {
       log(`Rolling back ${createdIds.length} documents...`);
-      try {
-        await Promise.all(
-          createdIds.map(id => databases.deleteDocument(databaseId, collectionId, id))
-        );
-        log("Rollback successful.");
-      } catch (rbErr) {
-        error("Critical: Rollback failed for IDs: " + createdIds.join(', '));
+
+      // Batch the rollback as well to avoid secondary fetch failures
+      for (let i = 0; i < createdIds.length; i += BATCH_SIZE) {
+        const batchIds = createdIds.slice(i, i + BATCH_SIZE);
+        try {
+          await Promise.all(batchIds.map(id => databases.deleteDocument(databaseId, collectionId, id)));
+          await sleep(50); // Shorter sleep for cleanup
+        } catch (rbErr) {
+          error(`Failed to delete IDs: ${batchIds.join(', ')}`);
+        }
       }
     }
 
-    // Return the error to React with a 500 status code
     return res.json({
       success: false,
       message: err.message,

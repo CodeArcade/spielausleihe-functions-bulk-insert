@@ -9,51 +9,64 @@ export default async ({ req, res, log, error }) => {
   const databases = new Databases(client);
   const createdIds = [];
 
-  const sleep = (ms) => new Promise(res => setTimeout(res, ms));
-
-  const safeCreateDocument = async (dbId, collId, data, retries = 2) => {
-    try {
-      return await databases.createDocument(dbId, collId, ID.unique(), data);
-    } catch (err) {
-      // If it's a fetch failure and we have retries left, wait and try again
-      if (retries > 0 && err.message.includes('fetch failed')) {
-        await sleep(500);
-        return safeCreateDocument(dbId, collId, data, retries - 1);
-      }
-      throw err;
-    }
-  };
-
+  // Helper to handle body parsing across different trigger types
   let body = req.bodyJson;
   if (typeof body === 'string') {
-    try { body = JSON.parse(body); } catch (e) { return res.json({ success: false }, 400); }
+    try {
+      body = JSON.parse(body);
+    } catch (e) {
+      return res.json({ success: false, message: "Invalid JSON body string" }, 400);
+    }
   }
 
   const { databaseId, collectionId, documents } = body || {};
 
   try {
-    for (const data of documents) {
-      const doc = await safeCreateDocument(databaseId, collectionId, data);
-      createdIds.push(doc.$id);
+    if (!databaseId || !collectionId || !Array.isArray(documents)) {
+      throw new Error("Missing databaseId, collectionId, or documents array.");
+    }
 
-      await sleep(50);
+    log(`Processing ${documents.length} documents...`);
+
+    for (const data of documents) {
+      try {
+        const doc = await databases.createDocument(
+          databaseId,
+          collectionId,
+          ID.unique(),
+          data
+        );
+        createdIds.push(doc.$id);
+      } catch (insertError) {
+        // We throw a standard error but attach the Appwrite error message
+        throw new Error(insertError.message || "Unknown database error");
+      }
     }
 
     return res.json({ success: true, count: createdIds.length }, 200);
 
   } catch (err) {
-    error(`Failed at doc ${createdIds.length + 1}: ${err.message}`);
+    error("Transaction failed: " + err.message);
 
-    // Sequential Rollback (Reliable)
+    // Rollback Logic
     if (createdIds.length > 0) {
-      for (const id of createdIds) {
-        try {
-          await databases.deleteDocument(databaseId, collectionId, id);
-          await sleep(30);
-        } catch (e) { error(`Rollback failed for ${id}`); }
+      log(`Rolling back ${createdIds.length} documents...`);
+      try {
+        await Promise.all(
+          createdIds.map(id => databases.deleteDocument(databaseId, collectionId, id))
+        );
+        log("Rollback successful.");
+      } catch (rbErr) {
+        error("Critical: Rollback failed for IDs: " + createdIds.join(', '));
       }
     }
 
-    return res.json({ success: false, message: err.message }, 500);
+    // Return the error to React with a 500 status code
+    return res.json({
+      success: false,
+      message: err.message,
+      rolledBack: createdIds.length > 0,
+      failedAtCount: createdIds.length
+    }, 500);
   }
 };

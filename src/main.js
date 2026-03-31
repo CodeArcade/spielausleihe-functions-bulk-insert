@@ -9,22 +9,22 @@ export default async ({ req, res, log, error }) => {
   const databases = new Databases(client);
   const createdIds = [];
 
-  let body = req.bodyJson;
+  let body = req.bodyJson || {};
   if (typeof body === 'string') {
     try { body = JSON.parse(body); } catch (e) {
-      return res.json({ success: false, message: "Invalid JSON body" }, 400);
+      return res.json({ success: false, message: "Invalid JSON" }, 400);
     }
   }
 
-  const { databaseId, collectionId, documents } = body || {};
+  const { databaseId, collectionId, documents } = body;
 
   try {
     if (!databaseId || !collectionId || !Array.isArray(documents)) {
       throw new Error("Missing databaseId, collectionId, or documents array.");
     }
 
-    const BATCH_SIZE = 25;
-    log(`Processing ${documents.length} documents in batches of ${BATCH_SIZE}...`);
+    const BATCH_SIZE = 15;
+    log(`Processing ${documents.length} documents...`);
 
     for (let i = 0; i < documents.length; i += BATCH_SIZE) {
       const chunk = documents.slice(i, i + BATCH_SIZE);
@@ -41,25 +41,22 @@ export default async ({ req, res, log, error }) => {
     return res.json({ success: true, count: createdIds.length }, 200);
 
   } catch (err) {
-    error("Transaction failed: " + err.message);
+    error("Batch failed: " + err.message);
 
     if (createdIds.length > 0) {
       log(`Rolling back ${createdIds.length} documents...`);
-      try {
-        // Rollback also benefits from batching if the list is huge
-        await Promise.all(
-          createdIds.map(id => databases.deleteDocument(databaseId, collectionId, id))
-        );
-        log("Rollback successful.");
-      } catch (rbErr) {
-        error("Critical: Rollback failed for IDs: " + createdIds.join(', '));
+      for (const id of createdIds) {
+        try {
+          await databases.deleteDocument(databaseId, collectionId, id);
+        } catch (rbErr) {
+          error(`Failed to delete ID ${id} during rollback.`);
+        }
       }
     }
 
     return res.json({
       success: false,
       message: err.message,
-      rolledBack: createdIds.length > 0,
       failedAtCount: createdIds.length
     }, 500);
   }
